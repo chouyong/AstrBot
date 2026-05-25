@@ -49,9 +49,10 @@ What is stubbed (TODO before production)
   payload. ``Image`` becomes a ``[image]`` placeholder, ``At`` becomes
   ``@<id>``. Real attachments require the WuKongIM file service
   (``/v1/file/upload``) which is not wired yet.
-* Webhook signature verification: a ``webhook_secret`` HMAC-SHA256 hook
-  is sketched but the exact header name varies by WuKongIM deployment;
-  defaults to the ``X-Signature`` header WuKongIM 2.x uses.
+* Webhook signature verification: ``X-Signature`` + ``X-Timestamp`` headers.
+  Algorithm (both ends): ``base64(hmac_sha256(rawBody + "|" + timestamp, secret))``.
+  5-minute replay window enforced. Same as PHP ``WukongImService::verifyWebhookSignature()``.
+  If ``webhook_secret`` is empty the check is skipped (dev mode).
 
 How to enable
 -------------
@@ -72,11 +73,23 @@ Add to AstrBot's platform config (``data/config/astrbot_config.json``)::
           "bot_token": "<system token issued by WuKongIM>",
           "wake_keywords": ["@客服", "@机器人", "找客服", "人工"],
           "platform_id": "qjl",
-          "handoff_endpoint": "http://deepmatch/api/im/handoff",
-          "handoff_token": "<shared secret with deepmatch>"
+          "handoff_endpoint": "http://deepmatch/api/im/handoff/receive",
+          "handoff_token": "<shared secret with deepmatch>",
+          "handoff_ttl_seconds": 3600
         }
       ]
     }
+
+Webhook signature (W8 resolved):
+  Both ends use: ``base64(hmac_sha256(rawBody + "|" + timestamp, secret))``
+  PHP side: ``WukongImService::verifyWebhookSignature($rawBody, $sig, $ts)``
+  Python side: ``handle_webhook`` checks ``X-Signature`` + ``X-Timestamp``.
+
+Release-handoff HTTP endpoint (E2):
+  deepmatch cron/admin POSTs to ``http://<astrbot_host>:<webhook_port>/astrbot/release_handoff``
+  Header:  X-Token: <handoff_token>
+  Body:    {"channel_id": "cs_u_42", "channel_type": 3, "ticket_id": 88}
+  Configure deepmatch ``wukong_im.astrbot_release_handoff_url`` to point here.
 
 Then in WuKongIM's config, point ``webhook.url`` (or
 ``webhook.grpc.addr`` if you prefer gRPC; not supported here) at
@@ -237,6 +250,12 @@ class WuKongIMPlatformAdapter(Platform):
         app.router.add_post(self.webhook_path, self.handle_webhook)
         # Health probe — handy for Docker/k8s
         app.router.add_get(self.webhook_path + "/health", self._handle_health)
+        # E2: release_handoff HTTP endpoint — called by deepmatch cron/admin
+        # when a human operator finishes the session so the bot resumes.
+        # POST /astrbot/release_handoff
+        # Header: X-Token: <handoff_token>
+        # Body:   {"channel_id": "...", "channel_type": 3, "ticket_id": 42}
+        app.router.add_post("/astrbot/release_handoff", self._handle_release_handoff)
 
         runner = web.AppRunner(app)
         await runner.setup()
@@ -275,6 +294,34 @@ class WuKongIMPlatformAdapter(Platform):
     async def _handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "platform": "wukongim"})
 
+    async def _handle_release_handoff(self, request: web.Request) -> web.Response:
+        """E2: deepmatch cron/admin calls this to let the bot resume on a channel.
+
+        Authentication: X-Token header must match ``handoff_token`` config.
+        Body (JSON): {"channel_id": "...", "channel_type": 3, "ticket_id": 42}
+        """
+        if self.handoff_token:
+            provided = request.headers.get("X-Token", "")
+            if not hmac.compare_digest(self.handoff_token, provided):
+                logger.warning("[WuKongIM] release_handoff: X-Token mismatch")
+                return web.json_response({"status": "forbidden"}, status=403)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "bad_json"}, status=400)
+
+        channel_id = str(body.get("channel_id") or "")
+        if not channel_id:
+            return web.json_response({"status": "channel_id required"}, status=400)
+
+        self.release_handoff(channel_id)
+        logger.info(
+            f"[WuKongIM] release_handoff: bot resumed on channel_id={channel_id} "
+            f"ticket_id={body.get('ticket_id')!r}",
+        )
+        return web.json_response({"status": "ok", "channel_id": channel_id})
+
     async def handle_webhook(self, request: web.Request) -> web.Response:
         """aiohttp handler for incoming WuKongIM webhook POSTs."""
         try:
@@ -284,13 +331,33 @@ class WuKongIMPlatformAdapter(Platform):
             return web.json_response({"status": "error"}, status=400)
 
         # optional HMAC-SHA256 signature check
+        # W8 fix: align with PHP WukongImService::verifyWebhookSignature():
+        #   base64( hmac_sha256(rawBody + "|" + timestamp, webhook_secret) )
+        # X-Timestamp header carries unix-seconds; enforce 5-minute replay window.
         if self.webhook_secret:
             sig_header = request.headers.get("X-Signature", "")
-            expected = hmac.new(
-                self.webhook_secret.encode("utf-8"),
-                raw_body,
-                hashlib.sha256,
-            ).hexdigest()
+            ts_header = request.headers.get("X-Timestamp", "")
+            if not sig_header or not ts_header:
+                logger.warning("[WuKongIM] Webhook missing X-Signature/X-Timestamp — dropping")
+                return web.json_response({"status": "forbidden"}, status=403)
+            # replay-window: reject requests older than 5 minutes
+            try:
+                ts_int = int(ts_header)
+                if abs(time.time() - ts_int) > 300:
+                    logger.warning(
+                        f"[WuKongIM] Webhook timestamp too skewed: ts={ts_header} — dropping"
+                    )
+                    return web.json_response({"status": "forbidden"}, status=403)
+            except ValueError:
+                return web.json_response({"status": "forbidden"}, status=403)
+            signing_input = raw_body + b"|" + ts_header.encode("utf-8")
+            expected = base64.b64encode(
+                hmac.new(
+                    self.webhook_secret.encode("utf-8"),
+                    signing_input,
+                    hashlib.sha256,
+                ).digest()
+            ).decode("ascii")
             if not hmac.compare_digest(sig_header, expected):
                 logger.warning("[WuKongIM] Webhook signature mismatch — dropping")
                 return web.json_response({"status": "forbidden"}, status=403)
