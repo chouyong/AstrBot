@@ -12,10 +12,10 @@ Three AI intervention modes (v1.1 architecture doc §5)
 * Mode B — AI in groups (channel_type = 2 群组):
     Bot responds ONLY when @bot or when a configured wake keyword is hit.
     Otherwise the message is dropped and never reaches the LLM.
-* Mode C — AI in buyer/seller 1:1 (channel_type = 1 点对点):
-    Same wake rule as Mode B. Business backend pre-adds ``bot_uid`` to the
-    ``deal_<orderId>`` channel right after payment, then either party can
-    @ the bot to invoke it.
+* Mode C — AI in buyer/seller deal (channel_type = 2 群组):
+    Same wake rule as Mode B. Business backend creates the deal channel as
+    CT=2 (group) — CT=1 personal channels reject /channel/subscriber_add.
+    Bot is pre-added right after payment; either party can @ it to invoke.
 
 What this adapter owns
 ----------------------
@@ -745,8 +745,10 @@ class WuKongIMPlatformAdapter(Platform):
         | channel_type | rule                                                   |
         |--------------|--------------------------------------------------------|
         | 3 (CS)       | always wake — except messages already in handoff       |
-        | 1 (1-1)      | wake only on @<bot_uid> or matching ``wake_keywords``  |
         | 2 (group)    | wake only on @<bot_uid> or matching ``wake_keywords``  |
+        |              | (includes deal_<orderId> channels — CT=1 rejected by  |
+        |              |  WK subscriber_add, so deal channels use CT=2)         |
+        | 1 (1-1)      | wake only on @<bot_uid> or matching ``wake_keywords``  |
         | other        | do not wake                                            |
 
         Messages whose ``channel_id`` is currently in human-handoff state are
